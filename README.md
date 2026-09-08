@@ -152,6 +152,18 @@ the factory. Useful when you'd rather not (or can't yet) hit the running service
 `lobby-fallback.mjs` before running (it only reads `lobby-cache.json` once at startup), then start it
 again afterward.
 
+### Live `ratings(...)` (needs `ELO_REGISTRY_ADDRESS`)
+
+If `ELO_REGISTRY_ADDRESS` is set, the lobby's `ratings(...)` query is also self-answered: it reads
+`ChessEloRegistry.effectiveRating(address)` live (current block, not a ranged log query) for every
+address that has ever appeared as `whitePlayer`/`blackPlayer` on a known table. This exists because
+Ponder's own indexed `rating` rows can be permanently missing for a player whose `RatingUpdated`
+event fell in a block range Ponder's scan skipped past (typically after a `START_BLOCK` bump used to
+route around the historical-state pruning problem) — the table itself might get recovered via
+`/add-table`, but its players' ratings would otherwise stay stuck at whatever Ponder last saw (or
+absent entirely), even though the table's own page reads the correct current rating directly from
+the contract. Leave `ELO_REGISTRY_ADDRESS` unset to keep proxying `ratings(...)` to Ponder as before.
+
 ## ops/ — indexer watchdog
 
 `ops/blockchess-indexer-watchdog.sh` + matching `.service`/`.timer` systemd units: a self-recovery
