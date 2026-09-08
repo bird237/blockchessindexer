@@ -19,9 +19,19 @@
 // Also serves a plain (non-GraphQL) POST /add-table { txHash } for registering a table this
 // scan hasn't reached yet, given just its creation transaction hash -- see addTableFromTxHash().
 //
+// If ELO_REGISTRY_ADDRESS is set, also self-answers `ratings(...)` by reading
+// ChessEloRegistry.effectiveRating(address) live for every known player -- Ponder's own indexed
+// `rating` rows can be permanently missing for players whose RatingUpdated event fell in a block
+// range Ponder skipped past (e.g. after a START_BLOCK bump to route around the historical-state
+// pruning issue), even though the table itself was later recovered via /add-table. Since
+// effectiveRating() already returns the default rating for anyone, this is a live-state read like
+// the table fields above, not a ranged log query -- immune to the same pruning class of failure.
+//
 // Env vars (same names/file as the real indexer's .env.local, reused on purpose):
 //   PONDER_RPC_URL_POLYGON   RPC endpoint
 //   FACTORY_ADDRESS          ChessGameFactory address
+//   ELO_REGISTRY_ADDRESS     ChessEloRegistry address (optional -- ratings(...) is proxied to
+//                            Ponder as before if unset)
 //   START_BLOCK              block to start scanning TableCreated from on first run
 //   PONDER_GRAPHQL_URL       real Ponder endpoint to proxy non-lobby queries to (default :42069)
 //   LOBBY_PORT               port this script listens on (default 42071)
@@ -36,6 +46,7 @@ import { fileURLToPath } from "node:url";
 
 const RPC_URL = process.env.PONDER_RPC_URL_POLYGON ?? "https://polygon-bor-rpc.publicnode.com";
 const FACTORY_ADDRESS = process.env.FACTORY_ADDRESS;
+const ELO_REGISTRY_ADDRESS = process.env.ELO_REGISTRY_ADDRESS;
 const START_BLOCK = BigInt(process.env.START_BLOCK ?? "0");
 const PONDER_URL = process.env.PONDER_GRAPHQL_URL ?? "http://127.0.0.1:42069/graphql";
 const PORT = Number(process.env.LOBBY_PORT ?? 42071);
@@ -106,6 +117,8 @@ const TABLE_ABI = [
   parseAbiItem("function totalBlackContribution() view returns (uint256)"),
   parseAbiItem("function token() view returns (address)"),
 ];
+
+const EFFECTIVE_RATING_ABI = parseAbiItem("function effectiveRating(address player) view returns (uint16)");
 
 // "History has been pruned for this block" comes from the specific backend node behind
 // polygon-bor-rpc.publicnode.com's load balancer that happened to serve a given request -- it's
@@ -402,6 +415,41 @@ async function getTables() {
   }
 }
 
+// Live effectiveRating() for every player that has ever appeared as whitePlayer/blackPlayer on a
+// known table -- not tied to Ponder ever having processed that player's RatingUpdated event, so a
+// table recovered via /add-table (or any table whose ELO update fell in a block range Ponder's own
+// scan skipped past) still shows a correct, current rating in the lobby immediately.
+let ratingsCache = null;
+let ratingsCachedAt = 0;
+
+async function getRatings() {
+  if (ratingsCache && Date.now() - ratingsCachedAt < REFRESH_TTL_MS) return ratingsCache;
+
+  const tables = await getTables();
+  const players = new Set();
+  for (const t of tables) {
+    for (const p of [t.whitePlayer, t.blackPlayer]) {
+      if (p && p !== "0x0000000000000000000000000000000000000000") players.add(p.toLowerCase());
+    }
+  }
+  if (players.size === 0) return [];
+
+  const addrs = [...players];
+  const results = await client.multicall({
+    contracts: addrs.map((addr) => ({
+      address: ELO_REGISTRY_ADDRESS,
+      abi: [EFFECTIVE_RATING_ABI],
+      functionName: "effectiveRating",
+      args: [addr],
+    })),
+    allowFailure: true,
+  });
+
+  ratingsCache = addrs.map((id, i) => ({ id, value: results[i]?.result ?? null })).filter((r) => r.value !== null);
+  ratingsCachedAt = Date.now();
+  return ratingsCache;
+}
+
 async function proxyToPonder(body) {
   const res = await fetch(PONDER_URL, {
     method: "POST",
@@ -458,6 +506,12 @@ const server = createServer((req, res) => {
         const items = await getBackers(variables.table);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ data: { backers: { items } } }));
+        return;
+      }
+      if (ELO_REGISTRY_ADDRESS && typeof query === "string" && /\bratings\s*\(/.test(query)) {
+        const items = await getRatings();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ data: { ratings: { items } } }));
         return;
       }
       const upstream = await proxyToPonder(body);
