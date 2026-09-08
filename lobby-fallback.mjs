@@ -16,14 +16,19 @@
 // needed). Everything else (backers, single-table-by-id) is still proxied straight through to
 // the real Ponder endpoint untouched.
 //
+// Also serves a plain (non-GraphQL) POST /add-table { txHash } for registering a table this
+// scan hasn't reached yet, given just its creation transaction hash -- see addTableFromTxHash().
+//
 // Env vars (same names/file as the real indexer's .env.local, reused on purpose):
 //   PONDER_RPC_URL_POLYGON   RPC endpoint
 //   FACTORY_ADDRESS          ChessGameFactory address
 //   START_BLOCK              block to start scanning TableCreated from on first run
 //   PONDER_GRAPHQL_URL       real Ponder endpoint to proxy non-lobby queries to (default :42069)
 //   LOBBY_PORT               port this script listens on (default 42071)
+//   LOBBY_RPC_FALLBACKS      comma-separated extra RPC URLs tried, in order, when a ranged
+//                            eth_getLogs call fails on the primary one (see getLogsResilient)
 
-import { createPublicClient, http, parseAbiItem } from "viem";
+import { createPublicClient, http, parseAbiItem, decodeEventLog } from "viem";
 import { polygon } from "viem/chains";
 import { createServer } from "node:http";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -102,7 +107,43 @@ const TABLE_ABI = [
   parseAbiItem("function token() view returns (address)"),
 ];
 
-const client = createPublicClient({ chain: polygon, transport: http(RPC_URL) });
+// "History has been pruned for this block" comes from the specific backend node behind
+// polygon-bor-rpc.publicnode.com's load balancer that happened to serve a given request -- it's
+// been observed to be inconsistent for the exact same block/range across repeated calls, which
+// points at different backend nodes with different pruning states rather than a hard cutoff. So
+// instead of trusting one endpoint, a ranged eth_getLogs call is retried against a short list of
+// independent public RPCs before giving up -- current-block reads (multicall) and per-tx lookups
+// (getTransactionReceipt/getBlock) don't need this, only ranged log scans do.
+//
+// Tenderly's public gateway is the only other free, no-key endpoint found that actually serves a
+// full 9999-block eth_getLogs call correctly (verified against a real, previously-pruned range).
+// Several other "free public RPC" options were tried and rejected: drpc.org's public gateway
+// refuses eth_getLogs outright regardless of range (misleading "over 10000 blocks" error even on
+// tiny ranges), 1rpc.io caps eth_getLogs at ~50 blocks (too small to be useful at our chunk size),
+// and ankr.com's public endpoint now requires an API key. Add more via LOBBY_RPC_FALLBACKS if you
+// find others that hold up.
+const FALLBACK_RPC_URLS = (process.env.LOBBY_RPC_FALLBACKS ?? "https://gateway.tenderly.co/public/polygon")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const RPC_URLS = [RPC_URL, ...FALLBACK_RPC_URLS.filter((u) => u !== RPC_URL)];
+const clients = RPC_URLS.map((url) => createPublicClient({ chain: polygon, transport: http(url) }));
+const client = clients[0]; // primary, used for every non-ranged-log call (getBlock, receipts, multicall)
+
+async function getLogsResilient(params) {
+  let lastErr;
+  for (let i = 0; i < clients.length; i++) {
+    try {
+      return await clients[i].getLogs(params);
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[lobby-fallback] getLogs failed on ${RPC_URLS[i]}: ${err.shortMessage ?? err.message ?? err}`);
+    }
+  }
+  throw lastErr;
+}
+
+const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
 // { tables: { "0xaddr": { creator, frontendRecipient, createdAtBlock, createdAtTimestamp } },
 //   lastScannedBlock: "123",
@@ -128,7 +169,7 @@ async function scanNewTables() {
   }
   while (from <= latest) {
     const to = from + LOG_CHUNK > latest ? latest : from + LOG_CHUNK;
-    const logs = await client.getLogs({
+    const logs = await getLogsResilient({
       address: FACTORY_ADDRESS,
       event: TABLE_CREATED,
       fromBlock: from,
@@ -215,8 +256,8 @@ async function scanTableMoves(tableAddress) {
   while (from <= latest) {
     const to = from + LOG_CHUNK > latest ? latest : from + LOG_CHUNK;
     const [moveLogs, takebackLogs] = await Promise.all([
-      client.getLogs({ address: addr, event: MOVE_MADE, fromBlock: from, toBlock: to }),
-      client.getLogs({ address: addr, event: TAKEBACK_ACCEPTED, fromBlock: from, toBlock: to }),
+      getLogsResilient({ address: addr, event: MOVE_MADE, fromBlock: from, toBlock: to }),
+      getLogsResilient({ address: addr, event: TAKEBACK_ACCEPTED, fromBlock: from, toBlock: to }),
     ]);
     const events = [
       ...moveLogs.map((l) => ({ type: "move", log: l })),
@@ -295,6 +336,52 @@ async function getBackers(tableAddress) {
   }));
 }
 
+// Registers a table by its creation tx hash alone -- no need to already know its address, and no
+// eth_getLogs range query needed either: the TableCreated log is decoded straight out of the
+// transaction's own receipt (receipt.logs), which -- unlike a ranged eth_getLogs query -- is never
+// subject to the "History has been pruned for this block" failure (receipts are cheap, permanent
+// per-tx records every node keeps; only the maintained log-range index gets pruned on some
+// backends). Confirmed by hitting that exact pruning error on this same block via a live
+// eth_getLogs call during testing, while the receipt for the identical tx resolved instantly.
+// Exposed over HTTP as POST /add-table so the frontend can offer a "paste the creation tx" recovery
+// box for a table the scan hasn't (yet, or ever will) pick up on its own.
+async function addTableFromTxHash(txHash) {
+  if (typeof txHash !== "string" || !TX_HASH_RE.test(txHash)) {
+    throw new Error("not a valid transaction hash");
+  }
+  const receipt = await client.getTransactionReceipt({ hash: txHash });
+  let decoded = null;
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== FACTORY_ADDRESS.toLowerCase()) continue;
+    try {
+      const event = decodeEventLog({ abi: [TABLE_CREATED], data: log.data, topics: log.topics });
+      decoded = event;
+      break;
+    } catch {
+      // a different factory event (e.g. TokenAllowlistUpdated) -- keep looking
+    }
+  }
+  if (!decoded) {
+    throw new Error("this transaction did not create a table on this factory");
+  }
+  const addr = decoded.args.table.toLowerCase();
+  if (!state.tables[addr]) {
+    const block = await client.getBlock({ blockNumber: receipt.blockNumber });
+    state.tables[addr] = {
+      creator: decoded.args.creator,
+      frontendRecipient: decoded.args.frontendRecipient,
+      createdAtBlock: receipt.blockNumber.toString(),
+      createdAtTimestamp: block.timestamp.toString(),
+    };
+  }
+  if (!state.moves[addr]) {
+    state.moves[addr] = { lastScannedBlock: (receipt.blockNumber - 1n).toString(), items: [] };
+  }
+  saveState();
+  cachedRows = null; // force the next tables() call to pick this table up immediately
+  return addr;
+}
+
 let cachedRows = null;
 let cachedAt = 0;
 let inFlight = null;
@@ -337,6 +424,18 @@ const server = createServer((req, res) => {
   req.on("data", (chunk) => (body += chunk));
   req.on("end", async () => {
     try {
+      if (req.method === "POST" && req.url === "/add-table") {
+        const { txHash } = JSON.parse(body || "{}");
+        try {
+          const addr = await addTableFromTxHash(txHash);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, table: addr }));
+        } catch (err) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: String(err.message ?? err) }));
+        }
+        return;
+      }
       const { query, variables } = JSON.parse(body || "{}");
       // "tables(...)" is the lobby list; "moves(...)" is one table's move history (variables.table
       // carries the address, matching useMoveHistory()'s own query shape). Anything else --
