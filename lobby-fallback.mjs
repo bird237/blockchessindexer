@@ -255,8 +255,28 @@ async function refreshLiveState() {
 // No board replay: plyIndex/potAfter/takenBack are pure bookkeeping over the two event streams,
 // mirroring exactly what the contract itself does to plyCount/pot on takeback (roll back one
 // ply, refund that move's stake) -- see GAME_MECHANICS.md section 5.
+//
+// Two overlapping calls for the SAME table (e.g. the frontend's 4s poll firing again before a
+// slow scan -- widened by getLogsResilient's retries -- has finished) used to both read the same
+// moveState.lastScannedBlock, both re-scan the same range, and both push the same moves onto
+// moveState.items, producing visible duplicates. moveScanInFlight collapses concurrent calls for
+// the same table into one in-progress scan, the same pattern getTables() already used for the
+// tables-wide scan.
+const moveScanInFlight = new Map();
+
 async function scanTableMoves(tableAddress) {
   const addr = tableAddress.toLowerCase();
+  if (moveScanInFlight.has(addr)) return moveScanInFlight.get(addr);
+  const promise = scanTableMovesUnlocked(addr);
+  moveScanInFlight.set(addr, promise);
+  try {
+    return await promise;
+  } finally {
+    moveScanInFlight.delete(addr);
+  }
+}
+
+async function scanTableMovesUnlocked(addr) {
   if (!state.moves[addr]) {
     state.moves[addr] = { lastScannedBlock: (START_BLOCK - 1n).toString(), items: [] };
   }
