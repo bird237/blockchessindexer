@@ -45,3 +45,67 @@ To protect transactional integrity, the frontend deliberately bypasses the index
 The indexer utilizes embedded PGlite (an in-process Postgres-compatible engine) by default, but can also connect to an external PostgreSQL database.
 
 Because the indexer maintains continuous websocket or polling subscriptions to EVM nodes and manages persistent database state, it must run as a single long-lived process per network rather than on a serverless architecture. Each network deployment requires its own instance, with target chain details and contract addresses supplied via environment configuration.
+
+## Local development
+
+```bash
+npm install
+cp .env.local.example .env.local   # fill in the values below for your deployment
+npm run dev                  # GraphQL at http://localhost:42069/graphql
+```
+
+Requires Node.js **>=22** (see `package.json`'s `engines` field). Uses an embedded PGlite Postgres
+by default — no external database needed for local development.
+
+### Environment variables
+
+| Variable | Meaning |
+|---|---|
+| `PONDER_RPC_URL_AMOY` | RPC URL for the chain being indexed (name is historical — read as a plain RPC URL by `ponder.config.ts` regardless of which network it actually points at; rename the config key there if you want it to read cleanly for your deployment) |
+| `FACTORY_ADDRESS` | `ChessGameFactory` address for this deployment |
+| `ELO_REGISTRY_ADDRESS` | `ChessEloRegistry` address for this deployment |
+| `START_BLOCK` | Block number the factory was deployed at — lets the indexer skip scanning the chain's history before the contracts existed |
+
+## Deploying
+
+**This cannot run on Vercel.** Vercel runs serverless functions that spin up per request and don't
+keep state between calls; Ponder is the opposite — a long-lived process that continuously syncs
+from the chain and keeps its own database. It needs a host that runs persistent processes:
+Railway, Fly.io, Render, or a plain VPS all work. Set the environment variables above and run
+`npm install && npm run start`.
+
+Run a separate instance per network (testnet vs. mainnet) with each network's own
+`FACTORY_ADDRESS`/`ELO_REGISTRY_ADDRESS`/`START_BLOCK` — don't let games from different networks
+mix in the same GraphQL data.
+
+## lobby-fallback.mjs
+
+A standalone, Ponder-independent Node.js service (`node lobby-fallback.mjs`) that answers the
+frontend's `tables(...)`, `moves(where:{tableId})`, and `backers(where:{tableId})` GraphQL queries
+directly from chain event logs (`TableCreated`, `MoveMade`, `TakebackAccepted`) plus current-block
+`multicall` reads — everything else is transparently proxied to the real Ponder instance.
+
+It exists because Ponder's own sync can get stuck: the public RPC's historical-state retention
+window is short and non-deterministic, and after a crash/restart it can permanently miss tables or
+moves that happened during the gap. This fallback never needs a historical `eth_call` (only current
+state + full log history), so it isn't exposed to that failure mode.
+
+Environment variables: `PONDER_RPC_URL_POLYGON`, `FACTORY_ADDRESS`, `START_BLOCK` (same meaning as
+above), plus `PONDER_GRAPHQL_URL` (real Ponder instance to proxy to, default
+`http://127.0.0.1:42069/graphql`) and `LOBBY_PORT` (default `42071`). Persists scan checkpoints to
+`lobby-cache.json` next to the script — delete this file if you change `START_BLOCK` and want the
+new value to actually take effect, since a cached checkpoint takes priority on startup.
+
+Point your reverse proxy/frontend at this service's port instead of Ponder's directly; it forwards
+anything it doesn't specially handle, so it's a drop-in replacement.
+
+## ops/ — indexer watchdog
+
+`ops/blockchess-indexer-watchdog.sh` + matching `.service`/`.timer` systemd units: a self-recovery
+watchdog for the main Ponder indexer (not for `lobby-fallback.mjs`, which doesn't need one). A
+systemd timer runs the script every minute; it greps recent indexer logs for the
+`historical state ... is not available` stuck-loop signature, and if found, bumps `START_BLOCK` to
+near the current chain head, wipes the local `.ponder` database, and restarts the service. Has a
+5-minute cooldown to avoid flapping. Requires only `curl` (no Foundry/`cast` dependency) to read the
+current block number. See the script's header comment for the exact paths/variables it expects on
+the host, and adjust them to match your deployment before installing.

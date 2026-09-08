@@ -1,0 +1,7 @@
+[Unit]
+Description=Auto-recover blockchess-indexer from stuck historical-state errors
+After=network.target blockchess-indexer.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/blockchess-indexer/blockchess-indexer-watchdog.sh
