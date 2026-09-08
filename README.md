@@ -90,14 +90,67 @@ window is short and non-deterministic, and after a crash/restart it can permanen
 moves that happened during the gap. This fallback never needs a historical `eth_call` (only current
 state + full log history), so it isn't exposed to that failure mode.
 
+Ranged `eth_getLogs` calls (used to scan for new tables and for move history) are still exposed to a
+*different*, also-inconsistent limitation: "History has been pruned for this block" from whichever
+backend node happens to be serving the request behind the public RPC's load balancer -- the same
+range can fail one moment and succeed the next. To work around it, every such call is retried
+against `LOBBY_RPC_FALLBACKS` (a comma-separated list of alternate RPC URLs, default
+`https://gateway.tenderly.co/public/polygon` -- the only other free, no-API-key endpoint found that
+actually serves full-size ranges correctly; several others were tried and rejected, see the code
+comment above `FALLBACK_RPC_URLS`) before giving up. Current-block reads (`multicall`) and per-tx
+lookups (`getTransactionReceipt`/`getBlock`) don't need this and aren't retried this way -- they've
+never been observed to fail this way.
+
 Environment variables: `PONDER_RPC_URL_POLYGON`, `FACTORY_ADDRESS`, `START_BLOCK` (same meaning as
-above), plus `PONDER_GRAPHQL_URL` (real Ponder instance to proxy to, default
-`http://127.0.0.1:42069/graphql`) and `LOBBY_PORT` (default `42071`). Persists scan checkpoints to
-`lobby-cache.json` next to the script — delete this file if you change `START_BLOCK` and want the
-new value to actually take effect, since a cached checkpoint takes priority on startup.
+above), `LOBBY_RPC_FALLBACKS` (see above), plus `PONDER_GRAPHQL_URL` (real Ponder instance to proxy
+to, default `http://127.0.0.1:42069/graphql`) and `LOBBY_PORT` (default `42071`). Persists scan
+checkpoints to `lobby-cache.json` next to the script — delete this file if you change `START_BLOCK`
+and want the new value to actually take effect, since a cached checkpoint takes priority on startup.
 
 Point your reverse proxy/frontend at this service's port instead of Ponder's directly; it forwards
 anything it doesn't specially handle, so it's a drop-in replacement.
+
+### POST /add-table — register a table by its creation tx hash
+
+For a table `lobby-fallback.mjs` missed on its own (its creation block predates the log-scan window
+you're running with, or you just don't want to wait for the next scan): register it directly by tx
+hash instead of restarting the scan from an earlier `START_BLOCK`, which would re-expose you to the
+same historical-read fragility this whole approach exists to avoid.
+
+```bash
+curl -X POST http://localhost:42071/add-table -H 'Content-Type: application/json' \
+  -d '{"txHash":"0x..."}'
+# -> { "ok": true, "table": "0x..." }
+```
+
+Decodes the `TableCreated` log straight out of the transaction's own receipt rather than a fresh
+`eth_getLogs` call — receipts are permanent per-tx records every node keeps, so this step alone is
+immune to log-range pruning (confirmed: an equivalent single-block `eth_getLogs` query for the same
+tx failed with "History has been pruned for this block" while the receipt resolved instantly). The
+table appears in the next `tables(...)` response immediately.
+
+Move history for that table is a separate concern: it's still recovered via the normal ranged
+`eth_getLogs` scan (from the table's creation block onward), which is subject to the same pruning
+inconsistency as everything else in this file — mitigated, not eliminated, by the `LOBBY_RPC_FALLBACKS`
+retry described above. In testing, the primary RPC failed outright on this exact scan for a table
+created ~2 days earlier, but the fallback (Tenderly's public gateway) recovered the full move history
+correctly on the very next attempt. If every fallback in the list also fails, that's a genuine gap
+short of running your own archival node -- add more URLs to `LOBBY_RPC_FALLBACKS` if you find ones
+that hold up.
+
+This is also exposed to end users directly, e.g. an "add a missing table by tx hash" box in the
+frontend's lobby — see `webapp/app/page.tsx`.
+
+### manual-add-table.mjs — same thing, from the command line
+
+```bash
+node manual-add-table.mjs <tableAddress> [creationTxHash]
+```
+
+Same receipt-decoding approach as `POST /add-table`, plus an `isTable(address)` sanity check against
+the factory. Useful when you'd rather not (or can't yet) hit the running service over HTTP. Stop
+`lobby-fallback.mjs` before running (it only reads `lobby-cache.json` once at startup), then start it
+again afterward.
 
 ## ops/ — indexer watchdog
 
