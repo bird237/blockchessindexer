@@ -1,29 +1,29 @@
 {
-  "name": "indexer",
-  "version": "0.0.1",
+  "name": "webapp",
+  "version": "0.1.0",
+  "license": "MIT",
   "private": true,
-  "type": "module",
   "scripts": {
-    "dev": "ponder dev",
-    "start": "ponder start",
-    "db": "ponder db",
-    "codegen": "ponder codegen",
-    "lint": "eslint .",
-    "typecheck": "tsc"
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "ponder": "^0.17.8",
-    "drizzle-orm": "0.41.0",
-    "hono": "^4.5.0",
-    "viem": "2.35.0"
+    "next": "16.3.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "viem": "2.56.0",
+    "wagmi": "2.19.5",
+    "@rainbow-me/rainbowkit": "2.2.11",
+    "@tanstack/react-query": "5.102.8"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "eslint": "^8.54.0",
-    "eslint-config-ponder": "^0.17.8",
-    "typescript": "^5.4.0"
-  },
-  "engines": {
-    "node": ">=22"
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5",
+    "tailwindcss": "4.3.3",
+    "@tailwindcss/postcss": "4.3.3"
   }
 }
